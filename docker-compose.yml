@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ticketforge-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ticketforge
+      POSTGRES_PASSWORD: ticketforge
+      POSTGRES_DB: ticketforge
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketforge -d ticketforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
