@@ -2,6 +2,8 @@ import Fastify from "fastify";
 import swagger from "@fastify/swagger";
 import swaggerUI from "@fastify/swagger-ui";
 import type { FastifyError } from "fastify";
+import { sql } from "drizzle-orm";
+import { db } from "./db/client.js";
 
 export async function buildApp() {
   const app = Fastify({
@@ -24,6 +26,19 @@ export async function buildApp() {
   app.get("/v1/health", async () => {
     return { status: "ok" };
   })
+
+  app.get("/v1/health/ready", async (_request, reply) => {
+    try {
+      await db.execute(sql`select 1`);
+      return { status: "ready", checks: { database: "ok" } };
+    } catch (error) {
+      app.log.error(error, "database readiness check failed");
+      return reply.status(503).send({
+        status: "not_ready",
+        checks: { database: "error" },
+      });
+    }
+  });
 
   app.setNotFoundHandler((_request, reply) => {
     return reply.status(404).send({

@@ -14,6 +14,21 @@ describe("API foundation", () => {
     await app.close()
   })
 
+  it("reports ready when the database is reachable", async () => {
+    const response = await app.inject({
+      method: "GET",
+      url: "/v1/health/ready",
+    })
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      status: "ready",
+      checks: {
+        database: "ok",
+      },
+    });
+  })
+
   it("returns ok status", async () => {
     const response = await app.inject({
       method: "GET",
