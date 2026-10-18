@@ -5,10 +5,21 @@ import type { FastifyError } from "fastify";
 import { sql } from "drizzle-orm";
 import { db } from "./db/client.js";
 
+import {
+  jsonSchemaTransform,
+  serializerCompiler,
+  validatorCompiler,
+  type ZodTypeProvider,
+} from "fastify-type-provider-zod";
+import { authRoutes } from "./modules/auth/auth.routes.js";
+
 export async function buildApp() {
   const app = Fastify({
     logger: true
-  });
+  }).withTypeProvider<ZodTypeProvider>();
+
+  app.setValidatorCompiler(validatorCompiler);
+  app.setSerializerCompiler(serializerCompiler);
 
   await app.register(swagger, {
     openapi: {
@@ -16,7 +27,8 @@ export async function buildApp() {
         title: "TicketForge API",
         version: "1.0.0"
       }
-    }
+    },
+    transform: jsonSchemaTransform,
   })
 
   await app.register(swaggerUI, {
@@ -39,6 +51,8 @@ export async function buildApp() {
       });
     }
   });
+
+  await app.register(authRoutes, { prefix: "/v1/auth" });
 
   app.setNotFoundHandler((_request, reply) => {
     return reply.status(404).send({
