@@ -14,6 +14,8 @@ const envSchema = z.object({
     .positive()
     .max(65535)
     .default(3000),
+  JWT_SECRET: z.string().min(32),
+
 })
 
 export const env = envSchema.parse(process.env);

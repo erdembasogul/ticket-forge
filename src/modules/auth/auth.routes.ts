@@ -1,9 +1,12 @@
 import type { FastifyPluginAsyncZod } from "fastify-type-provider-zod";
 import z from "zod";
 import { problemSchema } from "../../lib/problem.js";
-import { hash } from "argon2";
-import { users } from "../../db/schema.js";
+import { hash, verify } from "argon2";
+import { refreshTokens, users } from "../../db/schema.js";
 import { db } from "../../db/client.js";
+import { AppError } from "../../lib/errors.js";
+import { eq } from "drizzle-orm";
+import { createRefreshToken } from "./tokens.js";
 
 
 const registerBody = z.object({
@@ -17,6 +20,16 @@ const userResponse = z.object({
   email: z.string(),
   fullName: z.string(),
   role: z.enum(["admin", "user"])
+})
+
+const loginBody = z.object({
+  email: z.email(),
+  password: z.string().min(8).max(128),
+})
+
+const loginResponse = z.object({
+  accessToken: z.string(),
+  user: userResponse,
 })
 
 export const authRoutes: FastifyPluginAsyncZod = async (app) => {
@@ -50,16 +63,84 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
         });
 
       if (!user) {
-        return reply.status(409).send({
-          type: "about:blank",
-          title: "Conflict",
-          status: 409,
-          detail: "An account with this email already exists",
-          code: "EMAIL_TAKEN"
-        })
+        throw new AppError(409, "EMAIL_TAKEN", "An account with this email already exists");
       }
 
       return reply.status(201).send(user)
     }
-  )
+  ),
+    app.post(
+      "/login",
+      {
+        schema: {
+          tags: ["auth"],
+          body: loginBody,
+          response: {
+            200: loginResponse,
+            401: problemSchema
+          }
+        }
+      },
+      async (request, reply) => {
+        const email = request.body.email.toLowerCase();
+
+        const [user] = await db
+          .select({
+            id: users.id,
+            email: users.email,
+            fullName: users.fullName,
+            role: users.role,
+            passwordHash: users.passwordHash,
+          })
+          .from(users)
+          .where(eq(users.email, email))
+          .limit(1)
+
+        // Kullanıcı yoksa da sahte verify: timing ile email sızmasın
+        const passwordHash =
+          user?.passwordHash ??
+          "$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        const valid = await verify(passwordHash, request.body.password).catch(
+          () => false,
+        );
+
+        if (!user || !valid) {
+          throw new AppError(401, "INVALID_CREDENTIALS", "Invalid email or password");
+        }
+
+        const accessToken = await reply.jwtSign(
+          { sub: user.id, role: user.role },
+          { expiresIn: "15m" }
+        )
+
+        const refresh = createRefreshToken();
+
+        await db.insert(refreshTokens).values({
+          userId: user.id,
+          tokenHash: refresh.tokenHash,
+          familyId: refresh.familyId,
+          expiresAt: refresh.expiresAt,
+        });
+
+        reply.setCookie("refreshToken", refresh.token, {
+          path: "/v1/auth",
+          httpOnly: true,
+          sameSite: "lax",
+          secure: false, // production'da true
+          expires: refresh.expiresAt,
+        });
+
+        return {
+          accessToken,
+          user: {
+            id: user.id,
+            email: user.email,
+            fullName: user.fullName,
+            role: user.role,
+          },
+        };
+
+      }
+    )
 }

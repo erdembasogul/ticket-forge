@@ -12,6 +12,10 @@ import {
   type ZodTypeProvider,
 } from "fastify-type-provider-zod";
 import { authRoutes } from "./modules/auth/auth.routes.js";
+import fastifyJwt from "@fastify/jwt";
+import fastifyCookie from "@fastify/cookie";
+import { env } from "./config/env.js";
+import { AppError } from "./lib/errors.js";
 
 export async function buildApp() {
   const app = Fastify({
@@ -35,6 +39,51 @@ export async function buildApp() {
     routePrefix: "/docs",
   })
 
+  await app.register(fastifyCookie);
+  await app.register(fastifyJwt, {
+    secret: env.JWT_SECRET
+  })
+
+  app.setNotFoundHandler((_request, reply) => {
+    return reply.status(404).send({
+      type: "about:blank",
+      title: "Not Found",
+      status: 404,
+      detail: "The requested resource was not found",
+      code: "NOT_FOUND",
+    })
+  })
+
+  app.setErrorHandler((error: FastifyError, _request, reply) => {
+
+    if (error instanceof AppError) {
+      return reply.status(error.statusCode).send({
+        type: "about:blank",
+        title: error.name,
+        status: error.statusCode,
+        detail: error.message,
+        code: error.code,
+      });
+    }
+
+    const statusCode = typeof error.statusCode === "number" ? error.statusCode : 500;
+
+    if (statusCode >= 500) {
+      app.log.error(error);
+    }
+
+    return reply.status(statusCode).send({
+      type: "about:blank",
+      title: statusCode >= 500 ? "Internal Server Error" : error.name,
+      status: statusCode,
+      detail:
+        statusCode >= 500
+          ? "An unexpected error occurred"
+          : error.message,
+      code: statusCode >= 500 ? "INTERNAL_ERROR" : "REQUEST_ERROR",
+    });
+  })
+
   app.get("/v1/health", async () => {
     return { status: "ok" };
   })
@@ -53,35 +102,6 @@ export async function buildApp() {
   });
 
   await app.register(authRoutes, { prefix: "/v1/auth" });
-
-  app.setNotFoundHandler((_request, reply) => {
-    return reply.status(404).send({
-      type: "about:blank",
-      title: "Not Found",
-      status: 404,
-      detail: "The requested resource was not found",
-      code: "NOT_FOUND",
-    })
-  })
-
-  app.setErrorHandler((error: FastifyError, _request, reply) => {
-    const statusCode = typeof error.statusCode === "number" ? error.statusCode : 500;
-
-    if (statusCode >= 500) {
-      app.log.error(error);
-    }
-
-    return reply.status(statusCode).send({
-      type: "about:blank",
-      title: statusCode >= 500 ? "Internal Server Error" : error.name,
-      status: statusCode,
-      detail:
-        statusCode >= 500
-          ? "An unexpected error occurred"
-          : error.message,
-      code: statusCode >= 500 ? "INTERNAL_ERROR" : "REQUEST_ERROR",
-    });
-  })
 
   return app;
 }
