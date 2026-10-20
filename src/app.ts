@@ -16,6 +16,7 @@ import fastifyJwt from "@fastify/jwt";
 import fastifyCookie from "@fastify/cookie";
 import { env } from "./config/env.js";
 import { AppError } from "./lib/errors.js";
+import { usersRoutes } from "./modules/users/users.routes.js";
 
 export async function buildApp() {
   const app = Fastify({
@@ -101,7 +102,9 @@ export async function buildApp() {
     }
   });
 
+
   await app.register(authRoutes, { prefix: "/v1/auth" });
+  await app.register(usersRoutes, { prefix: "/v1/users" });
 
   return app;
 }
