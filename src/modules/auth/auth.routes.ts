@@ -246,5 +246,31 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
           user,
         };
       }
+    ),
+    app.post(
+      "/logout",
+      {
+        schema: {
+          tags: ["auth"],
+          response: {
+            204: z.undefined(),
+          }
+        }
+      },
+      async (request, reply) => {
+        const rawToken = request.cookies.refreshToken;
+
+        if (rawToken) {
+          const tokenHash = hashToken(rawToken);
+
+          await db
+            .update(refreshTokens)
+            .set({ revokedAt: new Date() })
+            .where(eq(refreshTokens.tokenHash, tokenHash))
+        }
+
+        reply.clearCookie("refreshToken", { path: "/v1/auth" });
+        return reply.status(204).send();
+      }
     )
 }

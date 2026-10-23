@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { buildApp } from "../src/app";
+import { buildApp } from "../../src/app";
 import { randomUUID } from "node:crypto";
 
 
