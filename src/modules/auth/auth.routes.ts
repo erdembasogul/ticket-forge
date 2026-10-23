@@ -5,8 +5,8 @@ import { hash, verify } from "argon2";
 import { refreshTokens, users } from "../../db/schema.js";
 import { db } from "../../db/client.js";
 import { AppError } from "../../lib/errors.js";
-import { eq } from "drizzle-orm";
-import { createRefreshToken } from "./tokens.js";
+import { and, eq, isNull } from "drizzle-orm";
+import { createRefreshToken, hashToken } from "./tokens.js";
 
 
 const registerBody = z.object({
@@ -141,6 +141,110 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
           },
         };
 
+      }
+    ),
+    app.post(
+      "/refresh",
+      {
+        schema: {
+          tags: ["auth"],
+          response: {
+            200: loginResponse,
+            401: problemSchema
+          }
+        }
+      },
+      async (request, reply) => {
+        const rawToken = request.cookies.refreshToken;
+
+        if (!rawToken) {
+          throw new AppError(401, "INVALID_REFRESH_TOKEN", "Refresh token missing");
+        }
+
+        const tokenHash = hashToken(rawToken);
+
+        const [stored] = await db
+          .select()
+          .from(refreshTokens)
+          .where(eq(refreshTokens.tokenHash, tokenHash))
+          .limit(1);
+
+        if (!stored) {
+          throw new AppError(401, "INVALID_REFRESH_TOKEN", "Refresh token invalid");
+        }
+
+        if (stored.revokedAt) {
+          await db
+            .update(refreshTokens)
+            .set({ revokedAt: new Date() })
+            .where(
+              and(
+                eq(refreshTokens.familyId, stored.familyId),
+                isNull(refreshTokens.revokedAt),
+              ),
+            );
+
+          reply.clearCookie("refreshToken", { path: "/v1/auth" });
+
+          throw new AppError(
+            401,
+            "REFRESH_TOKEN_REUSE",
+            "Refresh token reuse detected",
+          );
+        }
+
+        if (stored.expiresAt.getTime() <= Date.now()) {
+          throw new AppError(401, "INVALID_REFRESH_TOKEN", "Refresh token expired");
+        }
+
+        const [user] = await db
+          .select({
+            id: users.id,
+            email: users.email,
+            fullName: users.fullName,
+            role: users.role,
+          })
+          .from(users)
+          .where(eq(users.id, stored.userId))
+          .limit(1);
+
+        if (!user) {
+          throw new AppError(401, "INVALID_REFRESH_TOKEN", "Refresh token invalid");
+        }
+
+        // Eski refresh'i iptal et (rotation)
+        await db
+          .update(refreshTokens)
+          .set({ revokedAt: new Date() })
+          .where(eq(refreshTokens.id, stored.id));
+
+        // Aynı family ile yeni refresh
+        const next = createRefreshToken(stored.familyId);
+
+        await db.insert(refreshTokens).values({
+          userId: user.id,
+          tokenHash: next.tokenHash,
+          familyId: next.familyId,
+          expiresAt: next.expiresAt,
+        });
+
+        const accessToken = await reply.jwtSign(
+          { sub: user.id, role: user.role },
+          { expiresIn: "15m" },
+        );
+
+        reply.setCookie("refreshToken", next.token, {
+          path: "/v1/auth",
+          httpOnly: true,
+          sameSite: "lax",
+          secure: false,
+          expires: next.expiresAt,
+        });
+
+        return {
+          accessToken,
+          user,
+        };
       }
     )
 }
