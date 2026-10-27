@@ -7,6 +7,7 @@ import { db } from "../../db/client.js";
 import { AppError } from "../../lib/errors.js";
 import { and, eq, isNull } from "drizzle-orm";
 import { createRefreshToken, hashToken } from "./tokens.js";
+import { env } from "../../config/env.js";
 
 
 const registerBody = z.object({
@@ -96,7 +97,6 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
           .where(eq(users.email, email))
           .limit(1)
 
-        // Kullanıcı yoksa da sahte verify: timing ile email sızmasın
         const passwordHash =
           user?.passwordHash ??
           "$argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -127,7 +127,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
           path: "/v1/auth",
           httpOnly: true,
           sameSite: "lax",
-          secure: false, // production'da true
+          secure: env.NODE_ENV === "production",
           expires: refresh.expiresAt,
         });
 
@@ -212,13 +212,11 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
           throw new AppError(401, "INVALID_REFRESH_TOKEN", "Refresh token invalid");
         }
 
-        // Eski refresh'i iptal et (rotation)
         await db
           .update(refreshTokens)
           .set({ revokedAt: new Date() })
           .where(eq(refreshTokens.id, stored.id));
 
-        // Aynı family ile yeni refresh
         const next = createRefreshToken(stored.familyId);
 
         await db.insert(refreshTokens).values({
@@ -237,7 +235,7 @@ export const authRoutes: FastifyPluginAsyncZod = async (app) => {
           path: "/v1/auth",
           httpOnly: true,
           sameSite: "lax",
-          secure: false,
+          secure: env.NODE_ENV === "production",
           expires: next.expiresAt,
         });
 

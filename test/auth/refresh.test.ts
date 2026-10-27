@@ -5,7 +5,6 @@ import { randomUUID } from "node:crypto";
 function cookieHeader(setCookie: string | string[] | undefined) {
   if (!setCookie) return "";
   const parts = Array.isArray(setCookie) ? setCookie : [setCookie];
-  // "refreshToken=...; Path=/v1/auth; HttpOnly" → sadece "refreshToken=..."
   return parts.map((c) => c.split(";")[0]).join("; ");
 }
 
