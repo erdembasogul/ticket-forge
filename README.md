@@ -1,61 +1,57 @@
-# TicketForge 🎟️
+# TicketForge
 
-> 🚧 **Geliştirme Aşamasında (Work in Progress)**  
-> Bu proje aktif olarak geliştirilmektedir. Temel veritabanı mimarisi ve güvenli Auth altyapısı tamamlandı; etkinlik yönetimi ve atomik rezervasyon motoru üzerinde çalışıyorum.
-
-[English](#english) | [Türkçe](#türkçe)
+[Türkçe](#türkçe) | [English](#english)
 
 ---
 
 ## Türkçe
 
-TicketForge, bilet satışı ve koltuk rezervasyonu süreçlerinde ortaya çıkan **race condition (aynı koltuğun aynı anda birden fazla kişiye satılması)** problemini çözmek amacıyla üzerinde çalıştığım bir Node.js / TypeScript backend projesidir.
+TicketForge, bilet satışı ve koltuk rezervasyonu süreçlerinde yaşanan **race condition (aynı koltuğun aynı anda iki kişiye satılması)**, **süreli koltuk tutma** ve **ödeme webhook tekrarları** gibi gerçek backend problemlerini çözmek için geliştirdiğim bir Node.js / TypeScript API projesidir.
 
-Amacım basit bir CRUD API yapmak değil; yüksek trafik altında veritabanı tutarlılığı (ACID), token güvenliği ve arka plan iş kuyrukları gibi backend dünyasının gerçek problemlerini adım adım, test güdümlü (TDD) inşa etmek.
+> **Mevcut Durum:** Backend çekirdeği, 31 entegrasyon testi, Dockerfile ve GitHub Actions CI tamamlandı. Sırada bu API'nin üstüne ince bir Next.js ön yüzü ve canlı deploy var.
 
-### 📍 Şu An Neredeyim? (Mevcut Durum)
+### Neleri Çözdüm?
 
-#### ✅ Tamamlanan Kısımlar:
-1. **Veritabanı & Altyapı:**
-   - PostgreSQL 16 (Docker Compose) ve Drizzle ORM ile 7 tablonun şeması kuruldu, migration ve seed scriptleri hazırlandı.
-   - Para birimlerinde floating-point hatalarını engellemek için tutarları doğrudan kuruş cinsinden `integer` (`price_cents`) olarak tuttum.
-   - RFC 9457 uyumlu Problem Details hata formatı ve `/v1/health/ready` (DB ping) endpoint'i hazır.
-2. **Güvenli Kimlik Doğrulama (Auth Engine):**
-   - **Argon2id:** Şifreleri güvenli hash'liyoruz. Giriş yaparken kullanıcı bulunamasa bile timing attack (kullanıcı saydırma) riskini önlemek için sahte hash doğrulaması koşturuyorum.
-   - **JWT + HttpOnly Cookie:** Kısa ömürlü (15 dk) access token ve veritabanında SHA-256 hash'i saklanan uzun ömürlü refresh token mimarisi.
-   - **Rotation & Reuse Detection:** Her refresh işleminde token yenileniyor. Daha önce kullanılmış (iptal edilmiş) bir refresh token tekrar gelirse, sistem bunu çalınma kabul edip o oturum zincirindeki (`family_id`) tüm token'ları tek sorguda iptal ediyor.
-   - Vitest ile auth akışının (register, login, refresh, reuse detection, logout) tüm entegrasyon testlerini yazdım.
+1. **Çift Satış Önleme (Row-Level Locking & Transaction):**
+   - Koltuk rezervasyonunda önce `SELECT` atıp sonra `UPDATE` yapmak yerine, tek bir PostgreSQL transaction'ı içinde `SELECT ... WHERE status = 'AVAILABLE' FOR UPDATE` ile satırları açıkça kilitliyorum.
+   - İstenen koltuk sayısı ile kilitlenen sayı eşleşmezse transaction `ROLLBACK` oluyor ve `409 Conflict` dönüyor (**ya hepsi ya hiçbiri**).
+   - 10 paralel isteğin aynı koltuk için yarıştığı entegrasyon testinde tam 1 istek `201`, 9 istek `409` alıyor.
 
----
+2. **Idempotency-Key & Güvenli Sipariş Akışı:**
+   - `POST /v1/orders` isteğinde `Idempotency-Key` başlığı zorunlu. Çift tıklama veya ağ tekrarında ikinci sipariş açılmıyor, mevcut sipariş `200 OK` ile dönüyor.
+   - Sipariş detayında ve iptalde IDOR koruması (`WHERE id = $1 AND user_id = $2`).
+   - İptal işleminde (`POST /v1/orders/:id/cancel`) sipariş satırı `FOR UPDATE` ile kilitlenip iptal ediliyor ve koltuklar tekrar `AVAILABLE` durumuna çekiliyor.
 
-#### 🚧 Şu An Üzerinde Çalıştığım ve Sırada Olanlar:
-1. **Etkinlikler & Koltuk Envanteri (Sıradaki Adım):**
-   - Cursor-based pagination ile etkinlik listeleme ve koltuk durumlarını (`AVAILABLE`, `RESERVED`, `SOLD`) dönme.
-2. **Atomik Rezervasyon Motoru (Temel Hedef):**
-   - Rezervasyon için Redis lock kurmak yerine, PostgreSQL'in satır kilidi gücünü kullanmayı planlıyorum:
-     ```sql
-     UPDATE tickets
-     SET status = 'RESERVED', reserved_at = NOW()
-     WHERE id = ANY($1) AND status = 'AVAILABLE'
-     RETURNING id;
-     ```
-   - Dönen satır sayısı istenen koltuk sayısından azsa transaction `ROLLBACK` edilecek ve istemciye `409 Conflict` dönecek.
-   - 100 eşzamanlı istek / 5 koltuk senaryosunu k6 yük testi ile doğrulayacağım.
-3. **BullMQ ile Süreli Rezervasyon:**
-   - 10 dakika içinde ödeme gelmezse koltukları otomatik serbest bırakan gecikmeli (delayed) kuyruk işçisi ve Redis çökmesine karşı fallback SQL cleaner.
+3. **Süreli Rezervasyon (BullMQ + Fallback Cleaner):**
+   - Sipariş açıldığında 10 dakikalık gecikmeli (delayed) iş BullMQ kuyruğuna atılıyor.
+   - Ayrı bir worker süreci (`src/worker.ts`) süre dolunca yalnızca hâlâ `PENDING` olan siparişleri `EXPIRED` yapıp koltukları serbest bırakıyor.
+   - Redis çökmesine veya kayıp işlere karşı 5 dakikada bir çalışan yedek SQL temizleyici (`orders.cleaner.ts`) devrede.
+
+4. **Stripe Ödeme & Idempotent Webhook:**
+   - `POST /v1/orders/:id/pay` mevcut açık bir Checkout Session varsa yenisini açmadan onu dönüyor (çifte tahsilat koruması).
+   - `POST /v1/webhooks/stripe` ham gövde (`fastify-raw-body`) ile `stripe-signature` doğrulaması yapıyor.
+   - `payments.provider_payment_id` üzerindeki `UNIQUE` kısıtı + `ON CONFLICT DO NOTHING` ile aynı webhook birden fazla kez gelse de tek işlem yapılıyor.
+   - Süresi dolmuş (`EXPIRED`) veya iptal edilmiş siparişe geç ödeme gelirse koltuk `SOLD` yapılmıyor, ödeme `REFUND_PENDING` olarak işaretleniyor.
+
+5. **Kimlik Doğrulama & Güvenlik:**
+   - **Argon2id** şifre hashleme ve olmayan kullanıcılar için sahte doğrulama ile timing-attack koruması.
+   - Kısa ömürlü (15 dk) stateless JWT access token + `HttpOnly` cookie içinde taşınan, DB'de SHA-256 hash'li refresh token.
+   - **Rotation & Reuse Detection:** İptal edilmiş eski bir refresh token tekrar kullanılırsa o `family_id` altındaki tüm oturumlar iptal ediliyor.
+   - Helmet, CORS, Redis tabanlı rate limiting, RFC 9457 hata formatı ve Pino log maskeleme (`redact`).
 
 ---
 
-### 🛠️ Teknoloji Tercihleri
+### Kullanılan Araçlar
 
-- **Fastify:** Düşük overhead, yerleşik Pino loglama ve güçlü plugin yapısı.
-- **TypeScript & Node 24:** `strict`, `NodeNext`, `noUncheckedIndexedAccess` ile derleme anında tam tip güvenliği.
-- **PostgreSQL 16 & Drizzle ORM:** Saf SQL kontrolünü kaybetmeden tip güvenli sorgular.
-- **Vitest:** `app.inject()` ile gerçek port açmadan hızlı HTTP entegrasyon testleri.
+- **Runtime & Dil:** Node.js 24 LTS, TypeScript (`strict`, `NodeNext`, `noUncheckedIndexedAccess`)
+- **API & Validasyon:** Fastify 5, Zod (`fastify-type-provider-zod`), Swagger UI (`/docs`)
+- **Veritabanı & Kuyruk:** PostgreSQL 16, Drizzle ORM, Redis 7 (`ioredis`), BullMQ
+- **Ödeme & Güvenlik:** Stripe SDK, `fastify-raw-body`, Argon2, `@fastify/jwt`, `@fastify/helmet`, `@fastify/cors`, `@fastify/rate-limit`
+- **Test & DevOps:** Vitest (`app.inject`), Docker (multi-stage build), GitHub Actions CI
 
 ---
 
-### 🚀 Yerel Olarak Çalıştırma
+### Yerel Kurulum
 
 Gereksinimler: Node 24+, pnpm, Docker
 
@@ -68,107 +64,120 @@ pnpm install
 # 2. Ortam değişkenlerini kopyala
 cp .env.example .env
 
-# 3. PostgreSQL container'ını başlat
+# 3. PostgreSQL ve Redis container'larını başlat
 docker compose up -d
 
-# 4. Tabloları oluştur ve test verisini yükle
+# 4. Tabloları oluştur ve örnek veriyi yükle
 pnpm db:migrate
 pnpm db:seed
 
-# 5. Sunucuyu başlat
+# 5. API sunucusunu başlat (ayrı terminalde worker için: pnpm dev:worker)
 pnpm dev
 ```
 
-- Swagger UI: `http://localhost:3000/docs`
-- Sağlık Kontrolü: `http://localhost:3000/v1/health/ready`
+- Swagger Dokümantasyonu: `http://localhost:3000/docs`
+- Liveness: `http://localhost:3000/v1/health`
+- Readiness (PostgreSQL + Redis): `http://localhost:3000/v1/health/ready`
 
-Mevcut testleri koşmak için:
+Testleri ve tip kontrolünü çalıştırmak için:
 ```bash
+pnpm typecheck
 pnpm test
 ```
+
+---
+
+### Sırada Ne Var?
+
+- [x] Auth (Register, Login, Refresh Rotation + Reuse Detection, Logout, Role Guard)
+- [x] Etkinlikler & Koltuk Envanteri (Bulk seat insert, Cursor pagination, Canlı `COUNT`, Publish)
+- [x] Siparişler & Atomik Rezervasyon (`FOR UPDATE`, Idempotency-Key, Eşzamanlılık testi)
+- [x] BullMQ TTL Worker + Fallback SQL Cleaner
+- [x] Stripe Checkout + İmza Doğrulamalı, Idempotent Webhook
+- [x] Helmet, CORS, Redis Rate Limit, Dockerfile & GitHub Actions CI
+- [ ] Next.js Ön Yüz (Etkinlik listesi, koltuk haritası, Stripe ödeme akışı)
+- [ ] Canlı Deploy & k6 Yük Testi
 
 ---
 ---
 
 ## English
 
-> 🚧 **Work in Progress**  
-> This repository is actively under development. The database schema and production-grade auth flow are fully completed and tested; event management and the atomic reservation engine are currently being built.
+TicketForge is a Node.js / TypeScript backend API built around real-world ticketing challenges: **preventing seat overbooking under concurrent load**, **expiring unpaid reservations reliably**, and **handling idempotent payment webhooks**.
 
-TicketForge is a Node.js and TypeScript backend project designed to tackle **concurrency and race conditions during high-demand seat reservations**.
+> **Status:** Core backend, 31 integration tests, multi-stage Dockerfile, and GitHub Actions CI are complete. Next up: a thin Next.js frontend and live deployment.
 
-The goal of this project is not just building a standard CRUD API, but learning and implementing real-world backend architectures: database transactions (ACID), token rotation with reuse detection, and delayed worker queues.
+### Key Problems Solved
 
-### 📍 Current Status
+1. **Zero Overbooking (Row-Level Locking & Transactions):**
+   - Seat reservations run inside a PostgreSQL transaction using explicit `SELECT ... WHERE status = 'AVAILABLE' FOR UPDATE` locking.
+   - If fewer rows are locked than requested, the transaction rolls back with `409 Conflict` (**all-or-nothing**).
+   - Verified with a 10-way concurrent race condition test where exactly 1 request returns `201` and 9 return `409`.
 
-#### ✅ What is completed so far:
-1. **Core Data Layer & Infrastructure:**
-   - PostgreSQL 16 (Docker Compose) and Drizzle ORM managing 7 relational tables with migrations and seed scripts.
-   - Currency math is kept strictly in integer cents (`price_cents`) to avoid floating-point inaccuracies.
-   - RFC 9457 Problem Details error handling and database readiness checks (`/v1/health/ready`).
-2. **Production-Grade Authentication:**
-   - **Argon2id:** Password hashing with timing-attack mitigation (dummy verification if user is not found to prevent email enumeration).
-   - **Stateless Access & State-Controlled Refresh:** 15-minute JWT access tokens + SHA-256 hashed refresh tokens stored in `HttpOnly` cookies.
-   - **Rotation & Reuse Detection:** Tokens are rotated on every `/refresh`. Replaying an already-revoked token triggers immediate invalidation of the entire `family_id` session chain.
-   - Full integration test suite covering auth edge cases with Vitest.
+2. **Idempotent Orders & Safe Cancellation:**
+   - `POST /v1/orders` requires an `Idempotency-Key` header so duplicate clicks return the existing order (`200 OK`) instead of creating double bookings.
+   - Order reads and cancellations enforce ownership checks (`WHERE id = $1 AND user_id = $2`).
+   - `POST /v1/orders/:id/cancel` locks the order row (`FOR UPDATE`), transitions it to `CANCELLED`, and releases seats back to `AVAILABLE`.
 
----
+3. **Timed Reservations (BullMQ + Fallback Cleaner):**
+   - Each order schedules a 10-minute delayed BullMQ job handled by a dedicated worker process (`src/worker.ts`).
+   - Conditional SQL updates (`WHERE status = 'PENDING'`) ensure paid orders are never expired.
+   - A 5-minute fallback SQL cleaner (`orders.cleaner.ts`) recovers expired orders even if Redis drops jobs.
 
-#### 🚧 In Progress & What I am building next:
-1. **Events & Seating Inventory (Current Step):**
-   - Cursor-based pagination for event discovery and seat status tracking (`AVAILABLE`, `RESERVED`, `SOLD`).
-2. **Atomic Reservation Engine (Core Focus):**
-   - Instead of relying on Redis distributed locks, planning to utilize PostgreSQL row-level locks:
-     ```sql
-     UPDATE tickets
-     SET status = 'RESERVED', reserved_at = NOW()
-     WHERE id = ANY($1) AND status = 'AVAILABLE'
-     RETURNING id;
-     ```
-   - Partial updates will trigger a transaction `ROLLBACK` and return `409 Conflict`.
-   - Concurrency will be validated with k6 load testing (e.g. 100 concurrent requests competing for 5 seats).
-3. **Queue TTL (BullMQ) & Stripe Integration:**
-   - 10-minute delayed reservation expiry jobs backed by a fallback SQL cleaner.
+4. **Stripe Checkout & Idempotent Webhooks:**
+   - `POST /v1/orders/:id/pay` reuses an existing open Checkout Session if present.
+   - `POST /v1/webhooks/stripe` verifies `stripe-signature` against the raw request body (`fastify-raw-body`).
+   - Duplicate webhooks are safely ignored via `UNIQUE (provider_payment_id)` + `ON CONFLICT DO NOTHING`.
+   - Late payments arriving for already `EXPIRED` or `CANCELLED` orders do not sell the seats; they are flagged as `REFUND_PENDING`.
+
+5. **Authentication & Security:**
+   - **Argon2id** hashing with dummy-hash verification to mitigate login timing attacks.
+   - 15-minute stateless JWT access tokens + SHA-256 hashed refresh tokens in `HttpOnly` cookies.
+   - **Rotation & Reuse Detection:** Replaying a revoked refresh token revokes the entire `family_id` session chain.
+   - Helmet, CORS, Redis-backed rate limiting, RFC 9457 Problem Details errors, and Pino log redaction.
 
 ---
 
-### 🛠️ Tech Stack & Choices
+### Tech Stack
 
-- **Fastify:** Performance, modular plugin architecture, and native Pino logging over Express.
-- **TypeScript & Node 24:** Strict type checks (`NodeNext`, `noUncheckedIndexedAccess`).
-- **PostgreSQL 16 & Drizzle ORM:** Strict schema migrations with full SQL control.
-- **Vitest:** In-memory integration testing with `app.inject()`.
+- **Runtime & Language:** Node.js 24 LTS, TypeScript (`strict`, `NodeNext`, `noUncheckedIndexedAccess`)
+- **API & Validation:** Fastify 5, Zod (`fastify-type-provider-zod`), Swagger UI (`/docs`)
+- **Database & Queue:** PostgreSQL 16, Drizzle ORM, Redis 7 (`ioredis`), BullMQ
+- **Payments & Security:** Stripe SDK, `fastify-raw-body`, Argon2, `@fastify/jwt`, `@fastify/helmet`, `@fastify/cors`, `@fastify/rate-limit`
+- **Testing & DevOps:** Vitest (`app.inject`), multi-stage Dockerfile, GitHub Actions CI
 
 ---
 
-### 🚀 Getting Started
+### Getting Started
 
 Prerequisites: Node 24+, pnpm, Docker
 
 ```bash
-# Clone and install dependencies
+# Clone and install
 git clone https://github.com/erdembasogul/ticket-forge.git
 cd ticket-forge
 pnpm install
 
-# Setup environment variables
+# Configure environment
 cp .env.example .env
 
-# Start database
+# Start PostgreSQL and Redis
 docker compose up -d
 
-# Run migrations & seed data
+# Run migrations and seed data
 pnpm db:migrate
 pnpm db:seed
 
-# Start development server
+# Start API server (run worker in a second terminal: pnpm dev:worker)
 pnpm dev
 ```
 
-- Swagger API Docs: `http://localhost:3000/docs`
-- Readiness check: `http://localhost:3000/v1/health/ready`
+- Swagger UI: `http://localhost:3000/docs`
+- Liveness: `http://localhost:3000/v1/health`
+- Readiness (PostgreSQL + Redis): `http://localhost:3000/v1/health/ready`
 
-Run test suite:
+Run checks and tests:
 ```bash
+pnpm typecheck
 pnpm test
 ```

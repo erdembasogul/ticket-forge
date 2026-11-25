@@ -25,6 +25,7 @@ describe("API foundation", () => {
       status: "ready",
       checks: {
         database: "ok",
+        redis: "ok"
       },
     });
   })

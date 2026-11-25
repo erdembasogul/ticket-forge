@@ -16,6 +16,11 @@ const envSchema = z.object({
     .default(3000),
   JWT_SECRET: z.string().min(32),
 
+  REDIS_URL: z.string().default("redis://localhost:6379"),
+  CORS_ORIGIN: z.string().default("http://localhost:3001"),
+  STRIPE_SECRET_KEY: z.string().default("sk_test_mock_key"),
+  STRIPE_WEBHOOK_SECRET: z.string().default("whsec_mock_key"),
+
 })
 
 export const env = envSchema.parse(process.env);
